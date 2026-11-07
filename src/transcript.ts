@@ -204,6 +204,19 @@ function assistantContent(message: AssistantMessage): NativeContentBlock[] {
   return canonicalAssistantContent(message);
 }
 
+/**
+ * The model that produced a replayed assistant message. Claude Code drops
+ * signed thinking from a stream-json assistant message whose `model` is
+ * missing or differs from the model it calls (its cross-model thinking
+ * filter), so replayed frames name the model from the native carrier.
+ */
+function replayedModel(message: AssistantMessage): string | undefined {
+  const carrier = replayCarrier(message);
+  if (!carrier || !projectionsEqual(assistantProjection(message), carrier.projection)) return undefined;
+  const model = (carrier.message as { model?: unknown }).model;
+  return typeof model === "string" ? model : undefined;
+}
+
 export function prepareFrames(messages: Message[]): NativeFrame[] {
   const frames: NativeFrame[] = [];
 
@@ -212,6 +225,7 @@ export function prepareFrames(messages: Message[]): NativeFrame[] {
 
     let role: "user" | "assistant";
     let blocks: unknown[];
+    let model: string | undefined;
 
     if (message.role === "user") {
       role = "user";
@@ -219,6 +233,7 @@ export function prepareFrames(messages: Message[]): NativeFrame[] {
     } else if (message.role === "assistant") {
       role = "assistant";
       blocks = assistantContent(message);
+      model = replayedModel(message);
     } else {
       role = "user";
       blocks = [
@@ -236,7 +251,7 @@ export function prepareFrames(messages: Message[]): NativeFrame[] {
     if (role === "user" && previous?.type === "user") {
       previous.message.content.push(...blocks);
     } else {
-      frames.push({ type: role, message: { role, content: blocks } });
+      frames.push({ type: role, message: { role, ...(model ? { model } : {}), content: blocks } });
     }
   }
 

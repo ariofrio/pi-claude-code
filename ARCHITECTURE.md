@@ -53,6 +53,13 @@ tool-use boundaries fall back to a fresh process, which replays Pi's full
 conversation. At most two processes are retained, and no process is retained
 for more than five minutes.
 
+A replayed assistant message names the model that produced it (from its native
+carrier). Claude Code strips signed thinking from an assistant message whose
+`model` is missing or names another model, so without it earlier thinking would
+never reach the API. Workers also turn off Claude Code's silent-turn reminder,
+a system message Pi's history does not keep: replaying without it would change
+the prefix of later thinking, and the API would drop that thinking.
+
 ## Local turn relay
 
 Each Claude Code worker receives an `ANTHROPIC_BASE_URL` that points to a

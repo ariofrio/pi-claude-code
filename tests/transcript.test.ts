@@ -112,6 +112,47 @@ test("replays native signed blocks only while the visible projection is unchange
   assert.deepEqual(edited[1]?.message.content, [{ type: "text", text: "edited" }]);
 });
 
+test("names the answering model on replayed assistant frames so Claude Code keeps their thinking", () => {
+  const assistant: AssistantMessage = {
+    role: "assistant",
+    api: "test",
+    provider: "claude-code",
+    model: "sonnet",
+    content: [
+      { type: "thinking", thinking: "private", thinkingSignature: "signed" },
+      { type: "toolCall", id: "t1", name: "read", arguments: { path: "a" } },
+    ],
+    usage,
+    stopReason: "toolUse",
+    timestamp: 1,
+  };
+  const native = {
+    id: "m1",
+    role: "assistant" as const,
+    model: "claude-sonnet-5-5",
+    content: [
+      { type: "thinking" as const, thinking: "private", signature: "signed" },
+      { type: "tool_use" as const, id: "t1", name: `${TOOL_PREFIX}read`, input: { path: "a" } },
+    ],
+  };
+  assistant.diagnostics = [makeReplayDiagnostic(native, assistant) as never];
+  const history = (message: AssistantMessage): Message[] => [
+    { role: "user", content: "go", timestamp: 0 },
+    message,
+    { role: "toolResult", toolCallId: "t1", toolName: "read", content: [{ type: "text", text: "A" }], isError: false, timestamp: 2 },
+  ];
+
+  const frames = prepareFrames(history(assistant));
+  assert.equal(frames[1]?.message.model, "claude-sonnet-5-5");
+  assert.deepEqual(frames[1]?.message.content, native.content);
+
+  // Without a carrier (or with a stale one) there is no model to name.
+  const plain = prepareFrames(history({ ...assistant, diagnostics: undefined }));
+  assert.equal(plain[1]?.message.model, undefined);
+  const stale = prepareFrames(history({ ...assistant, content: [...assistant.content, { type: "text", text: "edited" }] }));
+  assert.equal(stale[1]?.message.model, undefined);
+});
+
 test("builds cache-stable native tool declarations and chronological system changes", () => {
   const alpha = {
     name: "alpha",

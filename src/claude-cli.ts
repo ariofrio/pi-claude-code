@@ -596,6 +596,10 @@ function processEnvironment(
     DISABLE_AUTO_COMPACT: "1",
     DISABLE_COMPACT: "1",
     CLAUDE_CODE_TOTAL_TOKENS_REMINDER: "off",
+    // Claude Code inserts "The user hasn't heard from you…" system messages
+    // that Pi's history does not keep. Replaying without them changes the
+    // prefix of later thinking, and the API drops it.
+    CLAUDE_CODE_SILENT_TURN_REMINDER: "0",
     DISABLE_ERROR_REPORTING: "1",
   });
   // These flags also disable the feature flags that unlock Claude Code's served
@@ -1103,7 +1107,14 @@ class ClaudeProcess {
     }
     this.tipHash = frameHistoryHash([
       ...input.frames,
-      { type: "assistant", message: { role: "assistant", content: message.content } },
+      {
+        type: "assistant",
+        message: {
+          role: "assistant",
+          ...(typeof message.model === "string" ? { model: message.model } : {}),
+          content: message.content,
+        },
+      },
     ]);
     return true;
   }
