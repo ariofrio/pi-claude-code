@@ -95,6 +95,17 @@ function canonicalModelId(info: DiscoveredClaudeModel): string {
   return withoutContextSuffix(info.resolvedModel || ALIASES[withoutContextSuffix(info.value)] || info.value);
 }
 
+/**
+ * Claude Code resolves aliases such as `sonnet` and `haiku` itself, and moves them to newer
+ * models, so routing by alias can reach a different model than the one Pi shows. Route by the
+ * resolved ID instead, keeping the 1M-context suffix. `default` is an alias by design.
+ */
+function nativeRoute(info: DiscoveredClaudeModel, id: string): string {
+  if (id === "default") return info.value;
+  const oneMillion = info.value.endsWith("[1m]") || info.resolvedModel?.endsWith("[1m]") === true;
+  return oneMillion ? `${id}[1m]` : id;
+}
+
 function fallbackModel(info: DiscoveredClaudeModel, id: string): ClaudeCodeModel {
   const supported = info.supportedEffortLevels;
   const thinkingLevelMap = supported?.length
@@ -138,7 +149,7 @@ export function modelFromDiscovery(info: DiscoveredClaudeModel): ClaudeCodeModel
   const id = canonicalModelId(info);
   const builtinId = id === "default" ? withoutContextSuffix(info.resolvedModel || "") : id;
   const builtin = BUILTIN_ANTHROPIC_MODELS[builtinId];
-  NATIVE_ROUTE_BY_ID.set(id, info.value);
+  NATIVE_ROUTE_BY_ID.set(id, nativeRoute(info, id));
   NATIVE_TOOL_CHANGES_BY_ID.set(id, builtin?.compat?.supportsMidConvoToolChanges === true);
   ADAPTIVE_THINKING_BY_ID.set(id, info.supportsAdaptiveThinking === true);
   DISABLED_THINKING_BY_ID.set(

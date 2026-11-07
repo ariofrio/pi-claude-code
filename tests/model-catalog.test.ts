@@ -19,8 +19,9 @@ test("fallback catalog matches Claude Code's selectable model families", () => {
     ],
   );
   assert.equal(nativeModel("default"), "default");
-  assert.equal(nativeModel("claude-opus-5-5"), "opus[1m]");
-  assert.equal(nativeModel("claude-sonnet-5"), "sonnet");
+  assert.equal(nativeModel("claude-opus-5-5"), "claude-opus-5-5[1m]");
+  assert.equal(nativeModel("claude-sonnet-5"), "claude-sonnet-5");
+  assert.equal(nativeModel("claude-haiku-4-5-20251001"), "claude-haiku-4-5-20251001");
   assert.equal(supportsNativeToolChanges("default"), true);
   assert.equal(supportsNativeToolChanges("claude-opus-5-5"), true);
   assert.equal(supportsNativeToolChanges("claude-fable-5-1"), true);
@@ -59,4 +60,26 @@ test("maps discovered aliases to stable canonical Pi model ids", () => {
   });
   assert.equal(future.id, "claude-future-1");
   assert.equal(future.cost.input, 0);
+});
+
+test("routes discovered aliases by their resolved model so Claude Code cannot swap models", () => {
+  // Claude Code resolves `haiku` and `sonnet` itself, and those aliases move to newer models.
+  const haiku = modelFromDiscovery({
+    value: "haiku",
+    resolvedModel: "claude-haiku-5-5",
+    displayName: "Haiku 5.5",
+    description: "Fastest for quick answers",
+  });
+  assert.equal(nativeModel(haiku.id), "claude-haiku-5-5");
+
+  const opus = modelFromDiscovery({
+    value: "opus[1m]",
+    resolvedModel: "claude-opus-5-5",
+    displayName: "Opus (1M context)",
+    description: "Opus 5.5 with 1M context",
+  });
+  assert.equal(nativeModel(opus.id), "claude-opus-5-5[1m]");
+
+  const unresolved = modelFromDiscovery({ value: "fable", displayName: "Fable", description: "" });
+  assert.equal(nativeModel(unresolved.id), "claude-fable-5-1");
 });
