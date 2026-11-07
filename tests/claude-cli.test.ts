@@ -305,14 +305,13 @@ test("injects native system history at assistant boundaries", () => {
   assert.deepEqual(rewritten.messages.map((message) => message.role), [
     "user",
     "system",
-    "system",
     "assistant",
     "user",
     "system",
     "system",
   ]);
   assert.equal(
-    ((rewritten.messages[2]?.content as Array<Record<string, unknown>>)[0] as Record<string, unknown>).type,
+    ((rewritten.messages[1]?.content as Array<Record<string, unknown>>)[0] as Record<string, unknown>).type,
     "tool_addition",
   );
   assert.equal(
@@ -324,8 +323,9 @@ test("injects native system history at assistant boundaries", () => {
     type: "ephemeral",
     ttl: "1h",
   });
+  assert.deepEqual(rewritten.system[2], { type: "text", text: "environment" });
   assert.deepEqual(
-    (rewritten.messages.at(-1)?.content as Array<Record<string, unknown>>).at(-1)?.cache_control,
+    (rewritten.messages[3]?.content as Array<Record<string, unknown>>).at(-1)?.cache_control,
     { type: "ephemeral", ttl: "1h" },
   );
 });
@@ -373,9 +373,99 @@ test("keeps one breakpoint in a pre-marked multi-block final message (issue #10)
           )
         : 0;
   assert.ok(count(rewritten) <= 4, `found ${count(rewritten)} cache_control markers`);
-  const final = rewritten.messages.at(-1).content as Array<Record<string, unknown>>;
-  assert.equal(final[0]?.cache_control, undefined);
+  // The marker moves off the trailing system message to the tool result before it.
+  assert.equal(JSON.stringify(rewritten.messages.at(-1)).includes("cache_control"), false);
+  const final = rewritten.messages.at(-2).content as Array<Record<string, unknown>>;
   assert.deepEqual(final.at(-1)?.cache_control, marker);
+});
+
+/** A request in cache-prefix order: tools, then system blocks, then message blocks, with breakpoint positions. */
+function cachePrefix(payload: Record<string, unknown>) {
+  const items: Array<{ role: string; block: unknown }> = [];
+  const breakpoints: number[] = [];
+  const add = (role: string, block: unknown) => {
+    if (isRecord(block) && block.cache_control) breakpoints.push(items.length);
+    items.push({ role, block: withoutMarkers(block) });
+  };
+  for (const tool of (payload.tools as unknown[] | undefined) ?? []) add("tools", tool);
+  for (const block of (payload.system as unknown[] | undefined) ?? []) add("top-level system", block);
+  for (const message of payload.messages as Array<Record<string, unknown>>) {
+    const { role, content, ...settings } = message;
+    const blocks = typeof content === "string" ? [text(content)] : (content as unknown[]);
+    if (Object.keys(settings).length) items.push({ role: role as string, block: settings });
+    for (const block of blocks) add(role as string, block);
+  }
+  return { items, breakpoints };
+}
+
+const isRecord = (value: unknown): value is Record<string, unknown> => !!value && typeof value === "object";
+
+test("keeps each request's final cache breakpoint readable by the next request (Environment message)", () => {
+  // Bodies as Claude Code 2.1.316 sends them for a three-turn chat without tools.
+  const marker = { type: "ephemeral", ttl: "1h" };
+  const system = [
+    text("billing"),
+    { ...text("identity"), cache_control: marker },
+    { ...text("prompt"), cache_control: marker },
+  ];
+  const environment = {
+    role: "system",
+    content: [{ ...text("# Environment\nPrimary working directory: /work\nToday's date is 2026-11-06."), cache_control: marker }],
+    output_config: { effort: "medium" },
+  };
+  const date = { role: "system", content: [{ ...text("Today's date is 2026-11-06."), cache_control: marker }] };
+  const turns = [
+    [{ role: "user", content: [text(account), text("hi")] }, environment],
+    [
+      { role: "user", content: [text("hi")] },
+      withoutMarkers(environment),
+      { role: "assistant", content: [text("4")] },
+      { role: "user", content: [text(account), text("times 3")] },
+      date,
+    ],
+    [
+      { role: "user", content: [text("hi")] },
+      withoutMarkers(environment),
+      { role: "assistant", content: [text("4")] },
+      { role: "user", content: [text("times 3")] },
+      { role: "assistant", content: [text("12")] },
+      { role: "user", content: [text(account), text("minus 5")] },
+      date,
+    ],
+  ] as WireMessage[][];
+
+  const sent = turns.map((messages, index) => {
+    const canonical = messages
+      .filter((message) => message.role !== "system")
+      .map((message) => ({
+        ...message,
+        content: (message.content as Block[]).filter((block) => block.text !== account),
+      }));
+    // The replay carrier snapshots request 1's native system messages.
+    const initialSystemMessages = index === 0 ? undefined : [structuredClone(environment)];
+    const body = Buffer.from(JSON.stringify({ system, messages }));
+    return JSON.parse(
+      rewriteInitialRequest(body, framesFor(canonical), initialSystemMessages).toString("utf8"),
+    ) as Record<string, unknown>;
+  });
+
+  for (const [index, payload] of sent.entries()) {
+    const { items, breakpoints } = cachePrefix(payload);
+    assert.ok(breakpoints.length <= 4, `request ${index + 1} has ${breakpoints.length} breakpoints`);
+    // An entry ending on a mid-conversation system message is not read back
+    // once an assistant turn follows it.
+    for (const position of breakpoints) {
+      assert.notEqual(items[position]?.role, "system", `request ${index + 1} marks a system message`);
+    }
+    // Claude Code's per-message effort stays where Claude Code put it.
+    assert.deepEqual((payload.messages as WireMessage[])[1], { role: "system", content: [], output_config: { effort: "medium" } });
+    assert.match(JSON.stringify(payload.system), /# Environment/u);
+
+    const next = sent[index + 1];
+    if (!next) continue;
+    const end = breakpoints.at(-1)! + 1;
+    assert.deepEqual(cachePrefix(next).items.slice(0, end), items.slice(0, end), `request ${index + 2} diverges`);
+  }
 });
 
 const userFrame = (text: string) => ({

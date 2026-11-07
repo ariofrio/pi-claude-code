@@ -723,8 +723,15 @@ function setReplayCacheBreakpoints(messages: NativeRequestMessage[]): void {
     }
     setCacheBreakpoint(messages[userIndexes.at(-2)!]!);
   }
-  const final = messages.at(-1);
-  if (final) setCacheBreakpoint(final);
+  // Not on a trailing system message: an entry ending there is not read back
+  // once the next request follows it with an assistant text turn.
+  const final = messages.findLast((message) => message.role !== "system");
+  if (final) {
+    for (const message of messages.slice(messages.indexOf(final) + 1)) {
+      message.content = withoutCacheControl(message.content);
+    }
+    setCacheBreakpoint(final);
+  }
 }
 
 type ContentBlock = Record<string, unknown>;
@@ -868,6 +875,35 @@ function withoutRepeatedSystemMessages(messages: NativeRequestMessage[]): Native
   });
 }
 
+/**
+ * Move the text of Claude Code's initial system messages (its Environment)
+ * out of `messages` and return it as top-level system blocks. A cache entry
+ * that ends on a mid-conversation system message is not read back once an
+ * assistant text turn follows it, so request 2 of every conversation missed
+ * request 1's final breakpoint. Per-message settings such as
+ * `output_config.effort` stay on a directive-only system message in place.
+ */
+function foldInitialSystemMessages(messages: NativeRequestMessage[]): ContentBlock[] {
+  const text = (value: string): ContentBlock => ({ type: "text", text: value });
+  let end = 1;
+  while (messages[end]?.role === "system") end += 1;
+  const blocks: ContentBlock[] = [];
+  const directives: NativeRequestMessage[] = [];
+  for (const message of messages.slice(1, end)) {
+    const { role, content, ...settings } = message as NativeRequestMessage & Record<string, unknown>;
+    const wire = typeof content === "string" ? [text(content)] : Array.isArray(content) ? content : [];
+    const kept: unknown[] = [];
+    for (const block of wire) {
+      if (isBlock(block) && block.type === "text" && typeof block.text === "string") {
+        if (block.text) blocks.push(text(block.text));
+      } else kept.push(withoutCacheControl(block));
+    }
+    if (kept.length || Object.keys(settings).length) directives.push({ role, content: kept, ...settings });
+  }
+  messages.splice(1, end - 1, ...directives);
+  return blocks;
+}
+
 export function rewriteInitialRequest(
   body: Buffer,
   frames: NativeFrame[],
@@ -895,12 +931,19 @@ export function rewriteInitialRequest(
     payload.messages = messages;
   }
 
+  const environment = Array.isArray(payload.system) ? foldInitialSystemMessages(messages!) : [];
+
   if (nativeSystemInjections) {
     messages = injectNativeSystemMessages(messages!, nativeSystemInjections);
     payload.messages = messages;
     normalizeLeadingSystemCache(payload.system);
   }
-  if (initialSystemMessages?.length || nativeSystemInjections) setReplayCacheBreakpoints(messages!);
+  // After the prompt's breakpoint, so it still caches across sessions whose
+  // Environment differs.
+  if (environment.length) (payload.system as unknown[]).push(...environment);
+  if (initialSystemMessages?.length || nativeSystemInjections || environment.length) {
+    setReplayCacheBreakpoints(messages!);
+  }
 
   return Buffer.from(JSON.stringify(payload));
 }
