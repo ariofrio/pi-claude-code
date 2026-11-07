@@ -377,7 +377,8 @@ if (process.argv.includes("auth") && process.argv.includes("status")) {
 if (process.argv.includes("--system-prompt-file")) {
   for (const name of ["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "DISABLE_TELEMETRY", "DISABLE_ERROR_REPORTING"]) {
     if (process.env[name] !== "1") throw new Error(\`worker privacy flag missing: \${name}\`);
-  }
+  }  const display = process.argv.indexOf("--thinking-display");
+  if (display < 0 || process.argv[display + 1] !== "summarized") throw new Error("thinking display not summarized");
 }
 if (process.cwd() !== process.env.EXPECTED_CWD) throw new Error(\`wrong cwd: \${process.cwd()}\`);
 if (process.env.CLAUDE_CODE_ENTRYPOINT !== "pi-agent") throw new Error(\`wrong entrypoint: \${process.env.CLAUDE_CODE_ENTRYPOINT}\`);

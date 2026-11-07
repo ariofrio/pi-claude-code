@@ -1006,6 +1006,10 @@ class ClaudeProcess {
         "stream-json",
         "--verbose",
         "--include-partial-messages",
+        // When the extra body sets no `thinking`, Claude Code otherwise requests
+        // `display: "updates"`, which returns empty thinking blocks.
+        "--thinking-display",
+        "summarized",
         "--tools",
         "",
         "--system-prompt-file",
