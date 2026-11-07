@@ -8,7 +8,8 @@ import { createInterface } from "node:readline";
 import { spawn, type ChildProcess } from "node:child_process";
 import { registerSessionResourceCleanup } from "@earendil-works/pi-ai";
 import { TurnRelay } from "./turn-relay.ts";
-import { usageCreditsAllowed, usageCreditsChargeError, type RateLimitInfo } from "./billing.ts";
+import { ToolBroker, type McpToolResult } from "./tool-broker.ts";
+import { rateLimitFromHeaders, usageCreditsAllowed, usageCreditsChargeError, type RateLimitInfo } from "./billing.ts";
 import { envFlagEnabled } from "./env.ts";
 import type { DiscoveredClaudeModel } from "./model-catalog.ts";
 import type {
@@ -69,7 +70,8 @@ export interface RunClaudeInput {
 
 export interface RunClaudeOutput {
   message: NativeMessage;
-  result: NativeResult;
+  /** Absent when the turn ended at a tool call that Claude Code is waiting on. */
+  result?: NativeResult;
   usage: NativeUsage;
   exitCode: number;
   relay: {
@@ -80,6 +82,8 @@ export interface RunClaudeOutput {
   initialSystemMessages?: unknown[];
   /** Latest plan-limit status Claude Code reported for this turn. */
   rateLimit?: RateLimitInfo;
+  /** Set (to the query's uuid) when the turn ended while Claude Code waits on held tool calls. */
+  heldTools?: string;
 }
 
 function configuredCommand(env: Record<string, string | undefined>): string {
@@ -275,8 +279,8 @@ const readyStatusCache = new Map<string, { command: string; expires: number }>()
 
 /**
  * Resolve a logged-in Claude Code executable. Successful checks are cached
- * briefly because a fresh worker is spawned after every tool call, and an
- * extra `claude auth status` process on each of those turns adds latency.
+ * briefly because every fresh worker needs one, and an extra
+ * `claude auth status` process on each of those turns adds latency.
  */
 async function readyClaudeCommand(
   envInput: Record<string, string | undefined>,
@@ -516,6 +520,11 @@ class AsyncQueue<T> {
   private ended = false;
   private failure?: Error;
 
+  /** Take a value that has already arrived, without waiting. */
+  take(): T | undefined {
+    return this.values.shift();
+  }
+
   push(value: T): void {
     const waiter = this.waiters.shift();
     if (waiter) waiter({ value, done: false });
@@ -593,6 +602,12 @@ function processEnvironment(
     CLAUDE_CODE_DISABLE_AUTO_MEMORY: "1",
     CLAUDE_CODE_DISABLE_CLAUDE_MDS: "1",
     CLAUDE_CODE_MAX_RETRIES: "0",
+    // Pi's tools run while Claude Code waits on the held MCP call; never move
+    // that wait to a background task.
+    CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS: "0",
+    // A continued run would otherwise get Claude Code's "the user hasn't heard
+    // from you" reminder after tool results, which Pi's history never has.
+    CLAUDE_CODE_SILENT_TURN_REMINDER: "0",
     DISABLE_AUTO_COMPACT: "1",
     DISABLE_COMPACT: "1",
     CLAUDE_CODE_TOTAL_TOKENS_REMINDER: "off",
@@ -942,12 +957,49 @@ function launchPlan(input: RunClaudeInput): ClaudeLaunchPlan {
   };
 }
 
+/** Events the worker's reader sees: Claude Code's output, plus local wake-ups. */
+type WorkerEvent = NativeOutputEvent | { type: "pi_wake" };
+
+const TOOL_PREFIX = "mcp__pi__";
+/**
+ * Claude Code's copy of a held tool result. Claude Code would truncate or
+ * persist large text it receives through MCP; the relay sends Pi's canonical
+ * result upstream instead, as it does for replayed tool results.
+ */
+const HELD_TOOL_RESULT: McpToolResult = { content: [{ type: "text", text: "(result delivered by Pi)" }] };
+
+/** A turn that ended while Claude Code waits on held calls for these tool uses. */
+interface HeldTools {
+  ids: string[];
+  /** Claude Code reports the eventual result for the user message that started the run. */
+  queryUuid: string;
+  tipHash: string;
+}
+
+/** Pi's results for exactly the held tool uses, or undefined if the next frame carries anything else. */
+function heldToolResults(frame: NativeFrame | undefined, ids: string[]): Map<string, McpToolResult> | undefined {
+  if (frame?.type !== "user" || frame.shouldQuery === false) return undefined;
+  const results = new Map<string, McpToolResult>();
+  for (const block of frame.message.content) {
+    if (!isBlock(block) || block.type !== "tool_result" || typeof block.tool_use_id !== "string") return undefined;
+    if (!ids.includes(block.tool_use_id) || results.has(block.tool_use_id)) return undefined;
+    // Claude Code may downscale a replayed image, and the relay keeps its copy.
+    // An image delivered through MCP is re-encoded differently, so replay instead.
+    if (Array.isArray(block.content) && block.content.some((part) => isBlock(part) && part.type === "image")) {
+      return undefined;
+    }
+    results.set(block.tool_use_id, HELD_TOOL_RESULT);
+  }
+  return results.size === ids.length ? results : undefined;
+}
+
 class ClaudeProcess {
   busy = false;
   readonly createdAt = Date.now();
   lastUsed = this.createdAt;
 
   private tipHash?: string;
+  private held?: HeldTools;
   private expiryTimer?: NodeJS.Timeout;
   private closed = false;
   private delivered = false;
@@ -958,7 +1010,8 @@ class ClaudeProcess {
     private readonly root: string,
     private readonly child: ChildProcess,
     private readonly relay: TurnRelay,
-    private readonly queue: AsyncQueue<NativeOutputEvent>,
+    private readonly broker: ToolBroker,
+    private readonly queue: AsyncQueue<WorkerEvent>,
     private readonly readTask: Promise<void>,
     private readonly exitOutcome: Promise<{ code?: number; error?: Error }>,
     private readonly timeoutMs: number,
@@ -978,6 +1031,8 @@ class ClaudeProcess {
     const inertMcpPath = fileURLToPath(new URL("./inert-mcp.mjs", import.meta.url));
     let child: ChildProcess | undefined;
     let relay: TurnRelay | undefined;
+    const queue = new AsyncQueue<WorkerEvent>();
+    const broker = new ToolBroker(() => queue.push({ type: "pi_wake" }));
 
     try {
       await Promise.all([
@@ -993,7 +1048,11 @@ class ClaudeProcess {
           // Standalone Pi is a Bun-compiled binary, so process.execPath is `pi`
           // itself rather than a JS runtime. BUN_BE_BUN makes it run the script
           // as Bun; Node ignores it.
-          pi: { command: process.execPath, args: [inertMcpPath, toolsPath], env: { BUN_BE_BUN: "1" } },
+          pi: {
+            command: process.execPath,
+            args: [inertMcpPath, toolsPath, await broker.start()],
+            env: { BUN_BE_BUN: "1" },
+          },
         },
       };
       const args = [
@@ -1016,10 +1075,12 @@ class ClaudeProcess {
         "",
         "--strict-mcp-config",
         "--disable-slash-commands",
-        "--max-turns",
-        "1",
         "--permission-mode",
         "dontAsk",
+        // Claude Code calls Pi's tools so the call can be held until Pi has the
+        // result. The inert server never executes anything itself.
+        "--allowedTools",
+        "mcp__pi",
         "--no-session-persistence",
         "--mcp-config",
         JSON.stringify(mcp),
@@ -1034,7 +1095,6 @@ class ClaudeProcess {
         windowsHide: true,
         stdio: ["pipe", "pipe", "pipe"],
       });
-      const queue = new AsyncQueue<NativeOutputEvent>();
       const reader = createInterface({ input: child.stdout!, crlfDelay: Infinity });
       const readTask = (async () => {
         try {
@@ -1055,11 +1115,12 @@ class ClaudeProcess {
         (code) => ({ code }),
         (error: unknown) => ({ error: error instanceof Error ? error : new Error(String(error)) }),
       );
-      return new ClaudeProcess(plan.fingerprint, root, child, relay, queue, readTask, exitOutcome, plan.timeoutMs);
+      return new ClaudeProcess(plan.fingerprint, root, child, relay, broker, queue, readTask, exitOutcome, plan.timeoutMs);
     } catch (error) {
       relay?.abort();
       if (child && child.exitCode === null) killProcessTree(child);
       await relay?.close();
+      await broker.close();
       await rm(root, { recursive: true, force: true });
       throw error;
     }
@@ -1074,7 +1135,15 @@ class ClaudeProcess {
   }
 
   canContinue(input: RunClaudeInput): boolean {
-    if (!this.tipHash || input.frames.length === 0) return false;
+    if (input.frames.length === 0) return false;
+    if (this.held) {
+      return (
+        !this.broker.broken &&
+        frameHistoryHash(input.frames.slice(0, -1)) === this.held.tipHash &&
+        !!heldToolResults(input.frames.at(-1), this.held.ids)
+      );
+    }
+    if (!this.tipHash) return false;
     return frameHistoryHash(input.frames.slice(0, -1)) === this.tipHash;
   }
 
@@ -1092,19 +1161,28 @@ class ClaudeProcess {
     this.expiryTimer.unref?.();
   }
 
-  commit(input: RunClaudeInput, message: NativeMessage): boolean {
-    // Claude Code executes MCP calls internally before emitting its max-turns
-    // result. Our inert MCP response is therefore part of its hidden history,
-    // while Pi will append the real tool result. That state is not a faithful
-    // continuation and must be discarded; the next request replays from Pi.
-    if (message.content.some((block) => block.type === "tool_use")) {
-      this.tipHash = undefined;
-      return false;
-    }
-    this.tipHash = frameHistoryHash([
+  commit(input: RunClaudeInput, output: RunClaudeOutput): boolean {
+    const { message } = output;
+    this.tipHash = undefined;
+    this.held = undefined;
+    const tip = frameHistoryHash([
       ...input.frames,
       { type: "assistant", message: { role: "assistant", content: message.content } },
     ]);
+    const toolUses = message.content.filter((block) => block.type === "tool_use");
+    if (toolUses.length === 0) {
+      this.tipHash = tip;
+      return true;
+    }
+    // Claude Code is waiting on a held call, so Pi's results can continue this
+    // process. A tool Pi never declared gets Claude Code's own error result and
+    // an extra generation the relay denies; that state is discarded, and so is
+    // a turn that Claude Code finished on its own.
+    const names = new Set(input.manifest.map((tool) => `${TOOL_PREFIX}${tool.name}`));
+    if (!output.heldTools || this.broker.broken || !toolUses.every((block) => names.has(String(block.name)))) {
+      return false;
+    }
+    this.held = { ids: toolUses.map((block) => String(block.id)), queryUuid: output.heldTools, tipHash: tip };
     return true;
   }
 
@@ -1117,11 +1195,16 @@ class ClaudeProcess {
     if (!this.isAlive()) throw new Error("Claude Code process is no longer available");
     input.signal?.throwIfAborted();
 
+    const held = continuation ? this.held : undefined;
+    this.held = undefined;
     let sawMessageStop = false;
     this.delivered = false;
     const deliver = (event: AnthropicStreamEvent) => {
       this.delivered = true;
-      if (event.type === "message_stop") sawMessageStop = true;
+      if (event.type === "message_stop") {
+        sawMessageStop = true;
+        this.queue.push({ type: "pi_wake" });
+      }
       input.onEvent?.(event);
     };
     this.relay.beginTurn(
@@ -1138,11 +1221,19 @@ class ClaudeProcess {
     const assistants: NativeMessage[] = [];
     let result: NativeResult | undefined;
     let nativeError: string | undefined;
-    let turnUuid: string | undefined;
+    let turnUuid: string | undefined = held?.queryUuid;
     let rateLimit: RateLimitInfo | undefined;
+    let heldTools: string | undefined;
 
     try {
-      const frames = continuation ? input.frames.slice(-1) : input.frames;
+      if (held) {
+        // Output Claude Code reported after the previous turn ended belongs to it.
+        while (this.queue.take());
+        // Claude Code already holds the assistant tool use in its history and
+        // waits on the MCP calls. Answering them continues the same run.
+        this.broker.provide(heldToolResults(input.frames.at(-1), held.ids)!);
+      }
+      const frames = held ? [] : continuation ? input.frames.slice(-1) : input.frames;
       for (const frame of frames) {
         const uuid = await writeFrame(this.child, frame);
         if (frame.shouldQuery === false) {
@@ -1164,7 +1255,22 @@ class ClaudeProcess {
       for (;;) {
         const event = await this.queue.next(input.signal, this.timeoutMs);
         if (!event) throw await this.exitError("Claude Code exited before completing its response");
-        if (event.type === "assistant") {
+        if (event.type === "pi_wake") {
+          // The response asked for tools and Claude Code is now waiting on a
+          // held call: the turn is complete from Pi's side.
+          const capture = this.relay.capture;
+          if (capture.complete && capture.message?.stop_reason === "tool_use" && this.broker.holding && turnUuid) {
+            heldTools = turnUuid;
+            await this.relay.settled();
+            // Collect what Claude Code already reported, such as its rate-limit event.
+            for (let late = this.queue.take(); late; late = this.queue.take()) {
+              if (late.type === "rate_limit_event" && late.rate_limit_info && typeof late.rate_limit_info === "object") {
+                rateLimit = late.rate_limit_info;
+              }
+            }
+            break;
+          }
+        } else if (event.type === "assistant") {
           const error = nativeErrorText(event);
           if (error !== undefined) nativeError = error;
           else assistants.push(event.message);
@@ -1175,7 +1281,9 @@ class ClaudeProcess {
           break;
         } else if (event.type === "rate_limit_event") {
           if (event.rate_limit_info && typeof event.rate_limit_info === "object") rateLimit = event.rate_limit_info;
-        } else if (event.type === "stream_event" && !this.relay.used) {
+        } else if (event.type === "stream_event" && !this.relay.used && !held) {
+          // A continued run always reaches the relay; native events still queued
+          // from its previous generation must not leak into this turn.
           deliver(event.event);
         }
       }
@@ -1214,7 +1322,7 @@ class ClaudeProcess {
 
       // Native error assistants are not collected; report their text instead of "Incomplete".
       if (!message && nativeError) throw new Error(`Claude Code API error: ${nativeError}`);
-      if (!message || !sawMessageStop || !result) {
+      if (!message || !sawMessageStop || !(result || heldTools)) {
         throw new Error(
           `Incomplete Claude Code response: assistant, message_stop and one result required${this.stderr ? ` (${this.stderr.trim().slice(-500)})` : ""}`,
         );
@@ -1223,20 +1331,25 @@ class ClaudeProcess {
       const nativeFailureHandled = this.relay.denied > 0 || message.stop_reason === "refusal";
       if (nativeError && !nativeFailureHandled) throw new Error(`Claude Code API error: ${nativeError}`);
       const hasTools = message.content.some((block) => block.type === "tool_use");
-      const maxTurnsBoundary = hasTools && result.subtype === "error_max_turns";
-      if (!maxTurnsBoundary && !nativeFailureHandled && (result.is_error || result.subtype !== "success")) {
+      const maxTurnsBoundary = hasTools && result?.subtype === "error_max_turns";
+      if (result && !maxTurnsBoundary && !nativeFailureHandled && (result.is_error || result.subtype !== "success")) {
         throw new Error(`Claude Code request failed: ${result.subtype ?? "unknown result"}`);
       }
 
-      const usage = message.usage ?? result.usage;
+      const usage = message.usage ?? result?.usage;
       if (!usage || typeof usage.input_tokens !== "number" || typeof usage.output_tokens !== "number") {
         throw new Error("Claude Code response did not include complete token usage");
       }
 
       // The response is already charged at this point, but stopping here keeps
       // Pi's agent loop from issuing more requests against usage credits.
-      if (rateLimit?.isUsingOverage === true && !usageCreditsAllowed({ ...process.env, ...input.env })) {
-        throw usageCreditsChargeError(rateLimit);
+      // Claude Code may report its rate-limit event only after a held turn has
+      // ended, so the response headers it derives that event from count too.
+      const headerRateLimit = this.relay.used ? rateLimitFromHeaders(this.relay.responseHeaders) : undefined;
+      rateLimit ??= headerRateLimit;
+      const overage = [rateLimit, headerRateLimit].find((info) => info?.isUsingOverage === true);
+      if (overage && !usageCreditsAllowed({ ...process.env, ...input.env })) {
+        throw usageCreditsChargeError(overage);
       }
 
       return {
@@ -1252,6 +1365,7 @@ class ClaudeProcess {
         initialSystemMessages:
           input.initialSystemMessages ?? deriveInitialSystemMessages(this.relay.originalRequestBody),
         rateLimit,
+        heldTools,
       };
     } finally {
       input.signal?.removeEventListener("abort", abort);
@@ -1261,7 +1375,7 @@ class ClaudeProcess {
 
   async close(): Promise<void> {
     this.closeNow();
-    await Promise.allSettled([this.readTask, this.exitOutcome, this.relay.close()]);
+    await Promise.allSettled([this.readTask, this.exitOutcome, this.relay.close(), this.broker.close()]);
     await rm(this.root, { recursive: true, force: true });
   }
 
@@ -1394,7 +1508,7 @@ export async function runClaudeRequest(input: RunClaudeInput): Promise<RunClaude
   const acquired = await acquireProcess(input, plan);
   try {
     const output = await acquired.worker.run(input, acquired.continuation);
-    const stable = acquired.worker.commit(input, output.message);
+    const stable = acquired.worker.commit(input, output);
     if (
       stable &&
       acquired.retained &&

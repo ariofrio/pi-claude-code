@@ -133,6 +133,7 @@ export class TurnRelay {
   denied = 0;
   status?: number;
   requestId?: string;
+  responseHeaders?: http.IncomingHttpHeaders;
   failure?: string;
   /** The upstream request failed before Anthropic sent a response status. */
   upstreamFailed = false;
@@ -191,6 +192,7 @@ export class TurnRelay {
     this.denied = 0;
     this.status = undefined;
     this.requestId = undefined;
+    this.responseHeaders = undefined;
     this.failure = undefined;
     this.upstreamFailed = false;
     this.errorBody = Buffer.alloc(0);
@@ -321,6 +323,7 @@ export class TurnRelay {
       });
       this.sockets.add(upstreamResponse);
       this.status = upstreamResponse.statusCode;
+      this.responseHeaders = upstreamResponse.headers;
       this.requestId =
         String(upstreamResponse.headers["request-id"] ?? upstreamResponse.headers["x-request-id"] ?? "") || undefined;
 

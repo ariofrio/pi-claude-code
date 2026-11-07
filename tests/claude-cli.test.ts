@@ -582,9 +582,9 @@ for await (const line of input) {
     assert.equal(cachedClaudeProcessCount(), 2);
     assert.equal((await readFile(processLog, "utf8")).trim().split("\n").length, 4);
 
-    // A tool call makes Claude's hidden history diverge because its inert MCP
-    // server has already returned a denial. Never retain that process; replay
-    // the real Pi tool result in a fresh process on the next request.
+    // A Claude Code run that ends at a tool call without waiting on the MCP
+    // server cannot be continued with Pi's result. Never retain that process;
+    // replay the real Pi tool result in a fresh process on the next request.
     const toolCommon = {
       ...common,
       manifest: [

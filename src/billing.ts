@@ -24,6 +24,33 @@ export interface RateLimitInfo {
 const USAGE_CREDITS_REJECTION =
   /third-party apps now draw from your extra usage|out of extra usage|draws? from your usage credits/iu;
 
+/**
+ * Rate-limit status from Anthropic's response headers, derived the way Claude
+ * Code derives its `rate_limit_event`. Used when a turn ends before Claude Code
+ * reports the event.
+ */
+export function rateLimitFromHeaders(
+  headers: Record<string, string | string[] | undefined> | undefined,
+): RateLimitInfo | undefined {
+  const header = (name: string) => {
+    const value = headers?.[`anthropic-ratelimit-unified-${name}`];
+    return Array.isArray(value) ? value[0] : value;
+  };
+  const status = header("status");
+  if (!status && !header("overage-status")) return undefined;
+  const overageStatus = header("overage-status");
+  const resetsAt = Number(header("reset"));
+  const rateLimitType = header("representative-claim");
+  const effective = status ?? "allowed";
+  return {
+    status: effective === "allowed_warning" ? "allowed" : effective,
+    ...(Number.isFinite(resetsAt) && header("reset") ? { resetsAt: Math.round(resetsAt) } : {}),
+    ...(rateLimitType ? { rateLimitType } : {}),
+    ...(overageStatus ? { overageStatus } : {}),
+    isUsingOverage: effective === "rejected" && (overageStatus === "allowed" || overageStatus === "allowed_warning"),
+  };
+}
+
 export function usageCreditsAllowed(env: Record<string, string | undefined>): boolean {
   return envFlagEnabled(env[ALLOW_USAGE_CREDITS_ENV]);
 }

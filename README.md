@@ -122,9 +122,11 @@ overrides for Claude Code.
 ## Limitations
 
 - The extension is experimental.
-- Branching, editing earlier messages, or changing settings mid-conversation
-  starts a fresh Claude Code process that replays the conversation. The first
-  response after that can be slower and may use more quota.
+- Branching, editing earlier messages, compacting, or changing settings
+  mid-conversation starts a fresh Claude Code process that replays the
+  conversation. So do tool results that contain images, and messages you send
+  while a tool is running. The first response after that can be slower and may
+  use more quota.
 - Complex tool schemas (nullable types, `oneOf`, `allOf`, `anyOf`) may be
   simplified before Claude sees them.
 - On Windows, Windows PowerShell 5.1 mangles quoted arguments (such as the

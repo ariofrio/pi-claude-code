@@ -13,7 +13,9 @@ responses back into Pi's message format.
 Pi remains responsible for conversation history, approvals, compaction, and tool
 execution. The extension exposes Pi's tools to Claude Code through an inert MCP
 inventory. Claude can request a tool, but Claude Code cannot execute it; the
-request is returned to Pi instead.
+request is returned to Pi instead. Claude Code's call to the inert server is
+held open until Pi has run the tool, so the same Claude Code process can
+continue with Pi's result.
 
 ## Authentication
 
@@ -47,11 +49,31 @@ to the assistant message as a `claude-code.rate-limit` diagnostic.
 
 ## Process reuse
 
-Linear conversations may reuse a warm Claude Code process. Only exact linear
-continuations reuse one. Branches, edits, configuration changes, errors, and
-tool-use boundaries fall back to a fresh process, which replays Pi's full
-conversation. At most two processes are retained, and no process is retained
-for more than five minutes.
+Linear conversations may reuse a warm Claude Code process, including across
+tool calls. Only exact linear continuations reuse one:
+
+- After a final answer, the next user message is written to the same process.
+- After a tool-use response, Claude Code waits on its call to the inert MCP
+  server. The server forwards the call to a random loopback route owned by the
+  extension, which holds it. If Pi's next request has the same history and its
+  last message carries exactly the results for those tool uses, the held calls
+  are answered and Claude Code continues the same run; nothing is written to
+  its stdin. Claude Code's copy of each result is a placeholder, and the relay
+  sends Pi's result upstream in its place, so the request matches a full
+  replay. Calls that Claude Code has not made yet (it calls parallel tools one
+  at a time) are answered as soon as it makes them.
+
+Everything else falls back to a fresh process, which replays Pi's full
+conversation: branches, edits, compaction, configuration changes, errors, a
+user message sent alongside tool results, image tool results (Claude Code
+re-encodes images it receives through MCP differently from replayed ones),
+tools Pi never declared, and a held call that Claude Code abandoned (for
+example after a user-set `MCP_TOOL_TIMEOUT`). Workers disable Claude Code's
+MCP auto-backgrounding and its in-loop "silent turn" reminder, which a
+replayed history never contains.
+
+At most two processes are retained, and no process is retained for more than
+five minutes.
 
 ## Local turn relay
 
@@ -63,12 +85,16 @@ tool execution. In particular, it:
 
 - forwards exactly one Anthropic Messages request for each Pi turn and rejects
   additional native recovery attempts. Claude Code can otherwise issue another
-  generation after an inert MCP tool call, even with one turn and HTTP retries
-  disabled;
+  generation after a failed tool call or a `max_tokens` stop, even with HTTP
+  retries disabled. While Pi runs a tool, no turn is armed, so nothing reaches
+  the upstream API until Pi's next turn answers the held call;
 - captures and streams the first upstream response before Claude Code processes
   it, preserving signed thinking, tool arguments, usage, and the native stop
-  reason. This lets Pi retain a valid tool request even when Claude Code later
-  reports an `error_max_turns` boundary or a synthetic recovery error;
+  reason. A tool-use turn ends once the response is complete and Claude Code
+  waits on a held call, so Pi gets the tool request without waiting for Claude
+  Code's own result. The usage-credit guard also reads the response's
+  rate-limit headers, because Claude Code may report its `rate_limit_event`
+  only after that point;
 - rebuilds every user message from Pi's own history. Claude Code adds
   reminders to user messages and tool results (auto-memory, CLAUDE.md, the
   account email, attachments). The relay matches Pi's blocks to Claude Code's
