@@ -96,6 +96,27 @@ test("stabilizes Claude Code's native replay reminders and cache breakpoint", ()
   assert.deepEqual((rewritten.at(-1)?.content as Block[]).at(-1)?.cache_control, { type: "ephemeral", ttl: "1h" });
 });
 
+test("keeps the current per-message effort when replaying captured system messages", () => {
+  const environment = [{ type: "text", text: "environment reminder" }];
+  const canonical = [
+    { role: "user", content: [text("inspect")] },
+    { role: "assistant", content: [text("first reply")] },
+    { role: "user", content: [text("follow up")] },
+  ];
+  const captured = [{ role: "system", content: environment, output_config: { effort: "low" } }];
+  const wire = (settings: Record<string, unknown>) => [
+    canonical[0]!,
+    { role: "system", content: environment, ...settings },
+    ...canonical.slice(1),
+  ];
+
+  const raised = rewrite(wire({ output_config: { effort: "high" } }), framesFor(canonical), captured);
+  assert.deepEqual((raised[1] as Record<string, unknown>).output_config, { effort: "high" });
+  const dropped = rewrite(wire({}), framesFor(canonical), captured);
+  assert.equal("output_config" in (dropped[1] as Record<string, unknown>), false);
+  assert.deepEqual(withoutMarkers(dropped[1]?.content), environment);
+});
+
 test("strips reminders when the first user message carries none (issue #27)", () => {
   const canonical = [
     { role: "user", content: [text("inspect")] },
@@ -383,6 +404,7 @@ if (process.cwd() !== process.env.EXPECTED_CWD) throw new Error(\`wrong cwd: \${
 if (process.env.CLAUDE_CODE_ENTRYPOINT !== "pi-agent") throw new Error(\`wrong entrypoint: \${process.env.CLAUDE_CODE_ENTRYPOINT}\`);
 if (process.env.CLAUDE_CODE_DISABLE_FILE_MENTIONS !== "1") throw new Error("file mentions enabled");
 if (process.env.PROCESS_LOG) appendFileSync(process.env.PROCESS_LOG, \`\${process.pid}\\n\`);
+if (process.env.EFFORT_LOG) appendFileSync(process.env.EFFORT_LOG, \`\${process.env.CLAUDE_CODE_EFFORT_LEVEL ?? "unset"}\\n\`);
 const systemIndex = process.argv.indexOf("--system-prompt-file");
 if (systemIndex >= 0 && readFileSync(process.argv[systemIndex + 1], "utf8") !== process.env.EXPECTED_SYSTEM_PROMPT) {
   throw new Error("wrong system prompt");
@@ -658,6 +680,31 @@ for await (const line of input) {
     const bare = await warmTurns("bare-session", { STALE_RESULT: "bare" });
     assert.equal(bare.message.id, "m_fake");
     assert.equal((await readFile(processLog, "utf8")).trim().split("\n").length, 9);
+
+    // Claude Code writes its effort setting into a per-message `output_config`
+    // that overrides the top-level one, so each worker runs at Pi's level, and
+    // a level change starts a new worker. Without a level the user's
+    // inherited setting is cleared.
+    const effortLog = join(root, "effort.log");
+    process.env.CLAUDE_CODE_EFFORT_LEVEL = "max";
+    const atEffort = async (output_config?: { effort: string }) => {
+      const extraBody = { tools: [], ...(output_config ? { output_config } : {}) };
+      const warm = { ...common, extraBody, env: { ...common.env, EFFORT_LOG: effortLog }, sessionId: "effort-session" };
+      const one = await runClaudeRequest({ ...warm, frames: [userFrame("one")] });
+      await runClaudeRequest({
+        ...warm,
+        frames: [
+          { ...userFrame("one"), shouldQuery: false },
+          { type: "assistant", message: { role: "assistant", content: one.message.content } },
+          userFrame("two"),
+        ],
+      });
+    };
+    await atEffort({ effort: "low" });
+    await atEffort({ effort: "high" });
+    await atEffort();
+    assert.deepEqual((await readFile(effortLog, "utf8")).trim().split("\n"), ["low", "high", "unset"]);
+    delete process.env.CLAUDE_CODE_EFFORT_LEVEL;
 
     // A native error assistant reports its text, not an incomplete response.
     await assert.rejects(

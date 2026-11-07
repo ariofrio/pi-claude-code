@@ -606,6 +606,14 @@ function processEnvironment(
     env.DISABLE_TELEMETRY = "1";
   }
   if (typeof extraBody.max_tokens === "number") env.CLAUDE_CODE_MAX_OUTPUT_TOKENS = String(extraBody.max_tokens);
+  // Claude Code writes its own effort into a per-message `output_config`, which
+  // overrides the top-level one from CLAUDE_CODE_EXTRA_BODY. The variable also
+  // overrides `--effort`, so set or clear it rather than inherit the user's.
+  const effort = (extraBody.output_config as { effort?: unknown } | undefined)?.effort;
+  if (purpose === "request") {
+    if (typeof effort === "string") env.CLAUDE_CODE_EFFORT_LEVEL = effort;
+    else delete env.CLAUDE_CODE_EFFORT_LEVEL;
+  }
   return env;
 }
 
@@ -867,7 +875,17 @@ export function rewriteInitialRequest(
   if (initialSystemMessages?.length && messages) {
     let systemEnd = 1;
     while (messages[systemEnd]?.role === "system") systemEnd += 1;
-    messages.splice(1, systemEnd - 1, ...(structuredClone(initialSystemMessages) as NativeRequestMessage[]));
+    // The snapshot fixes the text; settings such as `output_config` come from
+    // this request, so a changed thinking level is not replaced by the first one.
+    const settings = Object.assign(
+      {},
+      ...messages.slice(1, systemEnd).map(({ role: _role, content: _content, ...rest }) => rest),
+    ) as Record<string, unknown>;
+    const snapshot = (structuredClone(initialSystemMessages) as NativeRequestMessage[]).map(
+      ({ role, content }) => ({ role, content }),
+    );
+    if (snapshot[0]) Object.assign(snapshot[0], settings);
+    messages.splice(1, systemEnd - 1, ...snapshot);
 
     const initialText = initialSystemMessages
       .map((message) => contentText((message as NativeRequestMessage).content))
