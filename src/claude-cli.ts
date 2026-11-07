@@ -872,10 +872,13 @@ export function rewriteInitialRequest(
     const initialText = initialSystemMessages
       .map((message) => contentText((message as NativeRequestMessage).content))
       .join("\n");
-    while (messages.at(-1)?.role === "system") {
-      const trailingText = contentText(messages.at(-1)?.content);
-      if (!trailingText || !initialText.includes(trailingText)) break;
-      messages.pop();
+    // Claude Code repeats initial reminders (e.g. today's date) after a tool
+    // result. A continued process keeps them in its history, but a replay from
+    // Pi does not, so drop them wherever they appear to keep both prefixes equal.
+    for (let index = messages.length - 1; index > initialSystemMessages.length; index--) {
+      if (messages[index]?.role !== "system") continue;
+      const text = contentText(messages[index]?.content);
+      if (text && initialText.includes(text)) messages.splice(index, 1);
     }
   }
 

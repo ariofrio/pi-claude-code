@@ -149,6 +149,52 @@ test("strips reminder tails from tool results whatever their separator or subset
   }
 });
 
+test("restores tool results that are empty or end with or without a newline", () => {
+  for (const content of ["", "x", "x\n"]) {
+    const canonical = [
+      { role: "user", content: [text("inspect")] },
+      { role: "assistant", content: [{ type: "tool_use", id: "t1", name: "read", input: {} }] },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: "t1", content }] },
+    ];
+    const wire = structuredClone(canonical);
+    (wire[2]!.content as Block[])[0]!.content = `${content}\n\n${account}`;
+    assert.deepEqual(rewrite(wire, framesFor(canonical)), canonical, JSON.stringify(content));
+  }
+});
+
+test("drops initial system reminders that a continued process kept in its history", () => {
+  const initialSystemMessages = [{ role: "system", content: "environment reminder\n\ndate reminder" }];
+  const canonical = [
+    { role: "user", content: [text("inspect")] },
+    { role: "assistant", content: [{ type: "tool_use", id: "t1", name: "read", input: {} }] },
+    { role: "user", content: [{ type: "tool_result", tool_use_id: "t1", content: "x" }] },
+    { role: "assistant", content: [text("OK")] },
+    { role: "user", content: [text("follow up")] },
+  ];
+  const wire = [
+    canonical[0]!,
+    { role: "system", content: "environment reminder" },
+    canonical[1]!,
+    canonical[2]!,
+    // Claude Code appended this after the tool result and kept it once the turn continued.
+    { role: "system", content: "date reminder" },
+    canonical[3]!,
+    canonical[4]!,
+    { role: "system", content: "unrelated notice" },
+    { role: "assistant", content: [text("later")] },
+    { role: "user", content: [text("again")] },
+  ];
+  const frames = framesFor([...canonical, { role: "assistant", content: [text("later")] }, { role: "user", content: [text("again")] }]);
+  const rewritten = rewrite(structuredClone(wire), frames, initialSystemMessages);
+  assert.deepEqual(
+    rewritten.map((message) => (message.role === "system" ? contentOf(message) : message.role)),
+    ["user", "environment reminder\n\ndate reminder", "assistant", "user", "assistant", "user", "unrelated notice", "assistant", "user"],
+  );
+});
+
+const contentOf = (message: WireMessage): string =>
+  typeof message.content === "string" ? message.content : (message.content as Block[]).map((block) => block.text).join("");
+
 test("strips reminder blocks from text-array tool results and keeps Claude Code's images", () => {
   const image = { type: "image", source: { type: "base64", media_type: "image/png", data: "original" } };
   const resized = { type: "image", source: { type: "base64", media_type: "image/png", data: "resized" } };
