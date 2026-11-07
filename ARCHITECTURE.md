@@ -53,6 +53,15 @@ tool-use boundaries fall back to a fresh process, which replays Pi's full
 conversation. At most two processes are retained, and no process is retained
 for more than five minutes.
 
+## Thinking level
+
+Claude Code adds its own effort setting to each request as a per-message
+`output_config`, which overrides the top-level effort. Workers set
+`CLAUDE_CODE_EFFORT_LEVEL` to the effort for Pi's thinking level, or clear it
+when thinking is disabled, so a level change also starts a fresh process.
+When the relay restores Claude Code's recorded initial system messages, it
+keeps the current request's per-message settings.
+
 ## Local turn relay
 
 Each Claude Code worker receives an `ANTHROPIC_BASE_URL` that points to a
