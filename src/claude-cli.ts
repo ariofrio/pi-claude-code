@@ -710,6 +710,12 @@ function setCacheBreakpoint(message: NativeRequestMessage): void {
 }
 
 function setReplayCacheBreakpoints(messages: NativeRequestMessage[]): void {
+  // The replay owns every breakpoint after the system messages. Claude Code's
+  // own marker on its last message is redundant once a Pi system update
+  // follows that message, and would add a fifth breakpoint.
+  for (const message of messages) {
+    if (message.role !== "system") message.content = withoutCacheControl(message.content);
+  }
   const userIndexes = messages
     .map((message, index) => (message.role === "user" ? index : -1))
     .filter((index) => index >= 0);
@@ -836,6 +842,30 @@ function injectNativeSystemMessages(
   return output;
 }
 
+const MAX_CACHE_BREAKPOINTS = 4;
+
+/**
+ * Enforce Anthropic's limit of four `cache_control` blocks across the whole
+ * request (tools, system, then messages), whatever placed them. Keeps the
+ * final breakpoint and drops the earliest others first: those cache the
+ * shortest prefixes, which the later breakpoints also cover.
+ */
+function capCacheBreakpoints(payload: Record<string, unknown>): void {
+  const holders: Record<string, unknown>[] = [];
+  const collect = (value: unknown): void => {
+    if (Array.isArray(value)) value.forEach(collect);
+    else if (isBlock(value)) {
+      if (value.cache_control) holders.push(value);
+      for (const [key, child] of Object.entries(value)) if (key !== "cache_control") collect(child);
+    }
+  };
+  collect(payload.tools);
+  collect(payload.system);
+  collect(payload.messages);
+  const excess = holders.length - MAX_CACHE_BREAKPOINTS;
+  for (const holder of holders.slice(0, Math.max(0, excess))) delete holder.cache_control;
+}
+
 function normalizeLeadingSystemCache(system: unknown): void {
   if (!Array.isArray(system)) return;
   for (const block of system) {
@@ -856,6 +886,7 @@ export function rewriteInitialRequest(
   const payload = JSON.parse(body.toString("utf8")) as {
     messages?: NativeRequestMessage[];
     system?: unknown;
+    tools?: unknown;
   };
   let messages = payload.messages;
   const first = messages?.[0];
@@ -886,6 +917,7 @@ export function rewriteInitialRequest(
   }
   if (initialSystemMessages?.length || nativeSystemInjections) setReplayCacheBreakpoints(messages!);
 
+  capCacheBreakpoints(payload);
   return Buffer.from(JSON.stringify(payload));
 }
 

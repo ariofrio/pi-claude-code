@@ -205,6 +205,78 @@ test("moves a breakpoint on a dropped reminder to the canonical tail", () => {
   assert.deepEqual(rewritten[0]?.content, [{ ...text("inspect"), cache_control: marker }]);
 });
 
+const countMarkers = (value: unknown): number =>
+  Array.isArray(value)
+    ? value.reduce((sum: number, child) => sum + countMarkers(child), 0)
+    : value && typeof value === "object"
+      ? Object.entries(value).reduce(
+          (sum: number, [key, child]) => sum + (key === "cache_control" ? 1 : countMarkers(child)),
+          0,
+        )
+      : 0;
+
+test("keeps four breakpoints when a Pi system update trails the final user message", () => {
+  // A Pi system message (e.g. changed MCP servers) after the last assistant has
+  // no assistant boundary yet, so it is injected after the final user message.
+  const marker = { type: "ephemeral", ttl: "1h" };
+  const body = {
+    system: [
+      { type: "text", text: "billing" },
+      { type: "text", text: "identity", cache_control: marker },
+      { type: "text", text: "prompt", cache_control: marker },
+    ],
+    tools: [{ name: "mcp__pi__bash", input_schema: { type: "object" }, cache_control: marker }],
+    messages: [
+      { role: "user", content: [text("first")] },
+      { role: "system", content: [text("environment")] },
+      { role: "assistant", content: [text("one")] },
+      { role: "user", content: [text("second")] },
+      { role: "assistant", content: [text("two")] },
+      { role: "user", content: [text(memory), { ...text("third"), cache_control: marker }] },
+    ],
+  };
+  const frames = framesFor([
+    { role: "user", content: [text("first")] },
+    { role: "assistant", content: [text("one")] },
+    { role: "user", content: [text("second")] },
+    { role: "assistant", content: [text("two")] },
+    { role: "user", content: [text("third")] },
+  ]);
+  const rewritten = JSON.parse(
+    rewriteInitialRequest(
+      Buffer.from(JSON.stringify(body)),
+      frames,
+      [{ role: "system", content: [{ type: "text", text: "environment", cache_control: marker }] }],
+      [{ beforeAssistant: null, content: [text("<mcp_servers>changed</mcp_servers>")] }],
+    ).toString("utf8"),
+  );
+  assert.ok(countMarkers(rewritten) <= 4, `found ${countMarkers(rewritten)} cache_control markers`);
+  assert.deepEqual(rewritten.tools[0].cache_control, marker);
+  assert.equal(countMarkers(rewritten.system), 1);
+  assert.equal(rewritten.messages.at(-1).role, "system");
+});
+
+test("caps breakpoints across the whole request and keeps the final one", () => {
+  const marker = { type: "ephemeral", ttl: "1h" };
+  const marked = (value: string): Block => ({ ...text(value), cache_control: marker });
+  const body = {
+    system: [marked("identity"), marked("prompt")],
+    tools: [{ name: "mcp__pi__bash", input_schema: { type: "object" }, cache_control: marker }],
+    messages: [
+      { role: "user", content: [marked("first")] },
+      { role: "assistant", content: [{ type: "tool_use", id: "t1", name: "mcp__pi__bash", input: {} }] },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: "t1", content: [marked("result")] }] },
+      { role: "assistant", content: [text("done")] },
+      { role: "user", content: [marked("last")] },
+    ],
+  };
+  const rewritten = JSON.parse(
+    rewriteInitialRequest(Buffer.from(JSON.stringify(body)), framesFor(body.messages), undefined).toString("utf8"),
+  );
+  assert.equal(countMarkers(rewritten), 4);
+  assert.deepEqual(rewritten.messages.at(-1).content.at(-1).cache_control, marker);
+});
+
 test("refuses requests that do not line up with Pi's history", () => {
   const frames = framesFor([
     { role: "user", content: [text("inspect")] },
