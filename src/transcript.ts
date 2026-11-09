@@ -137,10 +137,19 @@ function imageBlock(block: ImageContent): Record<string, unknown> {
   };
 }
 
+/**
+ * The API rejects blank text blocks in a message's own content, and Claude Code
+ * omits them from the user messages it sends, so they are not part of the
+ * canonical history either.
+ */
 function userContent(content: string | (TextContent | ImageContent)[]): unknown[] {
-  if (typeof content === "string") return content ? [{ type: "text", text: sanitizeSurrogates(content) }] : [];
-  return content.map((block) =>
-    block.type === "text" ? { type: "text", text: sanitizeSurrogates(block.text) } : imageBlock(block),
+  if (typeof content === "string") content = [{ type: "text", text: content }];
+  return content.flatMap((block) =>
+    block.type === "image"
+      ? [imageBlock(block)]
+      : block.text.trim()
+        ? [{ type: "text", text: sanitizeSurrogates(block.text) }]
+        : [],
   );
 }
 

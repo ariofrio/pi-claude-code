@@ -14,6 +14,7 @@ import {
   runClaudeRequest,
 } from "../src/claude-cli.ts";
 import type { NativeFrame } from "../src/native-types.ts";
+import { prepareFrames } from "../src/transcript.ts";
 import { createClaudeCodeProvider } from "../src/provider.ts";
 
 type Block = Record<string, unknown>;
@@ -203,6 +204,62 @@ test("moves a breakpoint on a dropped reminder to the canonical tail", () => {
     framesFor([{ role: "user", content: [text("inspect")] }]),
   );
   assert.deepEqual(rewritten[0]?.content, [{ ...text("inspect"), cache_control: marker }]);
+});
+
+test("never restores a blank text block that Claude Code omitted", () => {
+  const image = { type: "image" as const, data: "png", mimeType: "image/png" };
+  const nativeImage = { type: "image", source: { type: "base64", media_type: "image/png", data: "png" } };
+  const reply = (value: string): AssistantMessage => ({
+    role: "assistant",
+    api: "claude-code-stream-json",
+    provider: "claude-code",
+    model: "sonnet",
+    content: [{ type: "text", text: value }],
+    usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+    stopReason: "stop",
+    timestamp: 0,
+  });
+  const pasted = { role: "user" as const, content: [{ type: "text" as const, text: "" }, image], timestamp: 0 };
+
+  // The image-only message is the current turn: Claude Code omits the blank
+  // block but prepends a reminder, which must not stand in for it.
+  assert.deepEqual(
+    rewrite(
+      [
+        { role: "user", content: [text("hi")] },
+        { role: "assistant", content: [text("ok")] },
+        { role: "user", content: [text(account), nativeImage, text("what is this?")] },
+      ],
+      prepareFrames([
+        { role: "user", content: "hi", timestamp: 0 },
+        reply("ok"),
+        pasted,
+        { role: "user", content: "what is this?", timestamp: 0 },
+      ]),
+    ).at(-1)?.content,
+    [nativeImage, text("what is this?")],
+  );
+
+  // The image-only message is history: Claude Code sends the image alone.
+  assert.deepEqual(
+    rewrite(
+      [
+        { role: "user", content: [text("hi")] },
+        { role: "assistant", content: [text("ok")] },
+        { role: "user", content: [nativeImage] },
+        { role: "assistant", content: [text("a cat")] },
+        { role: "user", content: [text("thanks")] },
+      ],
+      prepareFrames([
+        { role: "user", content: "hi", timestamp: 0 },
+        reply("ok"),
+        pasted,
+        reply("a cat"),
+        { role: "user", content: "thanks", timestamp: 0 },
+      ]),
+    )[2]?.content,
+    [nativeImage],
+  );
 });
 
 test("refuses requests that do not line up with Pi's history", () => {

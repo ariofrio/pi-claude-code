@@ -69,6 +69,40 @@ test("prepares replay frames and groups tool results", () => {
   assert.equal(frames[2]?.shouldQuery, undefined);
 });
 
+test("drops blank user text blocks that the API rejects and Claude Code omits", () => {
+  const image = { type: "image" as const, data: "png", mimeType: "image/png" };
+  const nativeImage = { type: "image", source: { type: "base64", media_type: "image/png", data: "png" } };
+  const frames = prepareFrames([
+    { role: "user", content: [{ type: "text", text: "" }, image], timestamp: 1 },
+    {
+      role: "assistant",
+      api: "test",
+      provider: "claude-code",
+      model: "sonnet",
+      content: [{ type: "toolCall", id: "t1", name: "read", arguments: {} }],
+      usage,
+      stopReason: "toolUse",
+      timestamp: 2,
+    },
+    {
+      role: "toolResult",
+      toolCallId: "t1",
+      toolName: "read",
+      content: [{ type: "text", text: "" }, image],
+      isError: false,
+      timestamp: 3,
+    },
+    { role: "user", content: [{ type: "text", text: " \n " }, { type: "text", text: "next" }], timestamp: 4 },
+    { role: "user", content: " \n ", timestamp: 5 },
+  ]);
+  assert.deepEqual(frames[0]?.message.content, [nativeImage]);
+  assert.deepEqual(frames[2]?.message.content, [
+    // Blank text nested in a tool result is valid and Claude Code keeps it.
+    { type: "tool_result", tool_use_id: "t1", content: [{ type: "text", text: "" }, nativeImage], is_error: false },
+    { type: "text", text: "next" },
+  ]);
+});
+
 test("replays native signed blocks only while the visible projection is unchanged", () => {
   const assistant: AssistantMessage = {
     role: "assistant",
