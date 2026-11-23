@@ -8,7 +8,7 @@ import { createInterface } from "node:readline";
 import { spawn, type ChildProcess } from "node:child_process";
 import { registerSessionResourceCleanup } from "@earendil-works/pi-ai";
 import { TurnRelay } from "./turn-relay.ts";
-import { spliceEnabled, spliceRequest } from "./splice.ts";
+import { PLACEHOLDER_FRAME, spliceEnabled, splicePlaceholderEnabled, spliceRequest } from "./splice.ts";
 import { usageCreditsAllowed, usageCreditsChargeError, type RateLimitInfo } from "./billing.ts";
 import { envFlagEnabled } from "./env.ts";
 import type { DiscoveredClaudeModel } from "./model-catalog.ts";
@@ -1075,6 +1075,7 @@ class ClaudeProcess {
   }
 
   canContinue(input: RunClaudeInput): boolean {
+    if (splicePlaceholderEnabled({ ...process.env, ...input.env })) return this.placeholderReady;
     if (!this.tipHash || input.frames.length === 0) return false;
     return frameHistoryHash(input.frames.slice(0, -1)) === this.tipHash;
   }
@@ -1093,7 +1094,13 @@ class ClaudeProcess {
     this.expiryTimer.unref?.();
   }
 
+  placeholderReady = false;
+
   commit(input: RunClaudeInput, message: NativeMessage): boolean {
+    if (splicePlaceholderEnabled({ ...process.env, ...input.env })) {
+      this.placeholderReady = true;
+      return true;
+    }
     // Claude Code executes MCP calls internally before emitting its max-turns
     // result. Our inert MCP response is therefore part of its hidden history,
     // while Pi will append the real tool result. That state is not a faithful
@@ -1146,7 +1153,12 @@ class ClaudeProcess {
     let rateLimit: RateLimitInfo | undefined;
 
     try {
-      const frames = continuation ? input.frames.slice(-1) : input.frames;
+      const placeholder = splicePlaceholderEnabled({ ...process.env, ...input.env });
+      const frames = placeholder
+        ? [structuredClone(PLACEHOLDER_FRAME) as unknown as NativeFrame]
+        : continuation
+          ? input.frames.slice(-1)
+          : input.frames;
       for (const frame of frames) {
         const uuid = await writeFrame(this.child, frame);
         if (frame.shouldQuery === false) {

@@ -246,3 +246,10 @@ export function spliceEnabled(env: Record<string, string | undefined>): boolean 
   const value = env.PI_CLAUDE_CODE_SPLICE?.trim().toLowerCase();
   return !!value && !["0", "false", "no", "off"].includes(value);
 }
+
+/** Placeholder splice: Claude Code gets a stub prompt instead of Pi's history, and its process stays warm. */
+export function splicePlaceholderEnabled(env: Record<string, string | undefined>): boolean {
+  return env.PI_CLAUDE_CODE_SPLICE?.trim().toLowerCase() === "placeholder";
+}
+
+export const PLACEHOLDER_FRAME = { type: "user", message: { role: "user", content: [{ type: "text", text: "Continue." }] } } as const;
