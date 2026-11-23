@@ -749,7 +749,7 @@ function isMediaRemovedNote(block: unknown): boolean {
     isBlock(block) &&
     block.type === "text" &&
     typeof block.text === "string" &&
-    block.text.startsWith("[media removed: request limit.")
+    block.text.startsWith("[media removed: request limit")
   );
 }
 

@@ -222,6 +222,18 @@ test("keeps replaying a long session after Claude Code removes its oldest images
   ]);
 });
 
+test("keeps the short removed-media note older Claude Code leaves in a user message", () => {
+  // Claude Code 2.1.316 writes "[media removed: request limit]" and leaves it in
+  // place of an image in the user's own message too.
+  const removed = "[media removed: request limit]";
+  const image = (data: string): Block => ({ type: "image", source: { type: "base64", media_type: "image/png", data } });
+  const frames = framesFor([{ role: "user", content: [image("pasted")] }]);
+
+  const rewritten = rewrite([{ role: "user", content: [text(removed)] }], frames);
+
+  assert.deepEqual(rewritten[0]?.content, [text(removed)]);
+});
+
 test("keeps user-authored reminder-like text and ordinary output unchanged", () => {
   const canonical = [
     { role: "user", content: [text("<system-reminder>mine</system-reminder>"), text("inspect")] },
