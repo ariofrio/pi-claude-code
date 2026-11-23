@@ -154,6 +154,35 @@ function fixBillingHeader(system: unknown, firstUserText: string): void {
   );
 }
 
+/** Every tool_use needs a tool_result at the start of the next user message; answer interrupted ones. */
+export function answerOrphanedToolCalls(messages: WireMessage[]): number {
+  let added = 0;
+  for (let index = 0; index < messages.length; index++) {
+    const message = messages[index]!;
+    if (message.role !== "assistant" || !Array.isArray(message.content)) continue;
+    const ids = message.content.filter((b): b is Block => isBlock(b) && b.type === "tool_use").map((b) => b.id as string);
+    if (!ids.length) continue;
+    let next = messages[index + 1];
+    if (next?.role !== "user") {
+      next = { role: "user", content: [] };
+      messages.splice(index + 1, 0, next);
+    }
+    if (!Array.isArray(next.content)) next.content = typeof next.content === "string" ? [{ type: "text", text: next.content }] : [];
+    const content = next.content as unknown[];
+    const answered = new Set(
+      content.filter((b): b is Block => isBlock(b) && b.type === "tool_result").map((b) => b.tool_use_id as string),
+    );
+    const missing = ids.filter((id) => !answered.has(id));
+    content.unshift(
+      ...missing.map((id) => ({ type: "tool_result", tool_use_id: id, content: "(tool call was interrupted)", is_error: true })),
+    );
+    // tool_results must come before any other content in the message.
+    content.sort((a, b) => Number(isBlock(b) && b.type === "tool_result") - Number(isBlock(a) && a.type === "tool_result"));
+    added += missing.length;
+  }
+  return added;
+}
+
 export function spliceRequest(
   body: Buffer,
   frames: NativeFrame[],
@@ -198,6 +227,7 @@ export function spliceRequest(
     messages = [...output, ...trailing];
   }
 
+  answerOrphanedToolCalls(messages);
   enforceMediaLimits(messages);
 
   // Pi's turn boundaries: the previous queried user message and the final one.
