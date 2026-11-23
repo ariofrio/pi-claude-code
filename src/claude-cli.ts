@@ -8,6 +8,7 @@ import { createInterface } from "node:readline";
 import { spawn, type ChildProcess } from "node:child_process";
 import { registerSessionResourceCleanup } from "@earendil-works/pi-ai";
 import { TurnRelay } from "./turn-relay.ts";
+import { spliceEnabled, spliceRequest } from "./splice.ts";
 import { usageCreditsAllowed, usageCreditsChargeError, type RateLimitInfo } from "./billing.ts";
 import { envFlagEnabled } from "./env.ts";
 import type { DiscoveredClaudeModel } from "./model-catalog.ts";
@@ -1126,7 +1127,10 @@ class ClaudeProcess {
     };
     this.relay.beginTurn(
       deliver,
-      (body) => rewriteInitialRequest(body, input.frames, input.initialSystemMessages, input.nativeSystemInjections),
+      (body) =>
+        spliceEnabled({ ...process.env, ...input.env })
+          ? spliceRequest(body, input.frames, input.initialSystemMessages, input.nativeSystemInjections)
+          : rewriteInitialRequest(body, input.frames, input.initialSystemMessages, input.nativeSystemInjections),
       input.betas,
     );
 
