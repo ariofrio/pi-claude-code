@@ -595,6 +595,11 @@ function processEnvironment(
     CLAUDE_CODE_MAX_RETRIES: "0",
     DISABLE_AUTO_COMPACT: "1",
     DISABLE_COMPACT: "1",
+    // Pi owns the context window and compaction. Without this, Claude Code assumes
+    // 200k tokens for models its catalog doesn't know (e.g. newer than the CLI) and
+    // fails larger requests locally with "Prompt is too long" before sending them.
+    // It only takes effect while compaction is disabled.
+    CLAUDE_CODE_MAX_CONTEXT_TOKENS: "1000000",
     CLAUDE_CODE_TOTAL_TOKENS_REMINDER: "off",
     DISABLE_ERROR_REPORTING: "1",
   });

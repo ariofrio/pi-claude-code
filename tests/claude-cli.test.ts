@@ -560,6 +560,11 @@ if (process.argv.includes("--system-prompt-file")) {
 if (process.cwd() !== process.env.EXPECTED_CWD) throw new Error(\`wrong cwd: \${process.cwd()}\`);
 if (process.env.CLAUDE_CODE_ENTRYPOINT !== "pi-agent") throw new Error(\`wrong entrypoint: \${process.env.CLAUDE_CODE_ENTRYPOINT}\`);
 if (process.env.CLAUDE_CODE_DISABLE_FILE_MENTIONS !== "1") throw new Error("file mentions enabled");
+// Claude Code assumes 200k for models its catalog lacks and refuses larger requests locally;
+// Pi's history is the source of truth, so its window must not be capped by Claude Code.
+if (process.argv.includes("--system-prompt-file") && process.env.CLAUDE_CODE_MAX_CONTEXT_TOKENS !== "1000000") {
+  throw new Error(\`context window not lifted: \${process.env.CLAUDE_CODE_MAX_CONTEXT_TOKENS}\`);
+}
 if (process.env.PROCESS_LOG) appendFileSync(process.env.PROCESS_LOG, \`\${process.pid}\\n\`);
 const systemIndex = process.argv.indexOf("--system-prompt-file");
 if (systemIndex >= 0 && readFileSync(process.argv[systemIndex + 1], "utf8") !== process.env.EXPECTED_SYSTEM_PROMPT) {
